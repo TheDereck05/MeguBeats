@@ -1,4 +1,4 @@
-import os
+import os, sys
 import discord
 from discord.ext import commands
 from discord.utils import get
@@ -7,62 +7,78 @@ import webserver
 import asyncio
 from dotenv import load_dotenv
 import functools
+import subprocess
 
-#Carga Variables de entorno desde el archivo .env
+# Auto-update yt-dlp on startup
+def actualizar_yt_dlp():
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"], check=True)
+        print("✅ yt-dlp actualizado correctamente")
+    except subprocess.CalledProcessError:
+        print("⚠️ No se pudo actualizar yt-dlp")
+
+actualizar_yt_dlp()
+
+# Load environment variables
 load_dotenv()
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN") #Token de autenticación para Discord 
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
-#Configuración de intents para recibir contenido de mensajes
+# Bot setup
+token = DISCORD_TOKEN
 intents = discord.Intents.default()
 intents.message_content = True
-#Se inicializa el bot con el prefijo  "!" y los intents configurados
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Opciones para FFmpeg: reconexión automatica si falla el stream y sin procesamiento de vídeo
+# FFmpeg & yt-dlp options
 FFMPEG_OPTIONS = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
     'options': '-vn'
 }
-
-# Opciones para yt-dlp: Elegir la mejor calidad de audio, silencio en consola y sin listas de reproducción
 YDL_OPTIONS = {
     'format': 'bestaudio/best',
     'quiet': True,
-    'noplaylist': True
+    'noplaylist': True,
 }
 
-# Diccionario de colas de reproducción por servidor (guild_id ---> lista de queries o URLs)
+# Storage
+desconexion_timers = {}  # guild_id -> asyncio.Task
 music_queues = {}
 
-#Evento que se dispara cuando el bot esta listó y conectado 
+# Auto-disconnect after inactivity
+def iniciar_temporizador_desconexion(ctx):
+    async def desconectar_si_inactivo():
+        await asyncio.sleep(1200)  # 20 min
+        voz = get(bot.voice_clients, guild=ctx.guild)
+        if voz and voz.is_connected():
+            await voz.disconnect()
+            await ctx.send("⏱️ Me desconecté por inactividad de 20 minutos.")
+    # Cancel existing
+    anterior = desconexion_timers.get(ctx.guild.id)
+    if anterior:
+        anterior.cancel()
+    # Start a new
+    tarea = asyncio.create_task(desconectar_si_inactivo())
+    desconexion_timers[ctx.guild.id] = tarea
+
+# Events and commands
 @bot.event
 async def on_ready():
-    print("Estoy viva, EXPLOSIÓN") #Mensaje en la consola para indicar que el bot esta encendido 
+    print("Estoy viva, EXPLOSIÓN")
 
-#Evento que se dispara con cada mensaje, evita procesar mensajes de otros bots
 @bot.event
 async def on_message(message):
     if message.author.bot:
-        return  #Ignorar los mensajes del bot para que no se creeen bucles 
-    print(f"{message.author}: {message.content}") #Loguea {autor} y {contenido} en la consola
-    await bot.process_commands(message)  #Procesa los comandos registrados  
-#Comando que responde "pong" cuando envias !ping
+        return
+    await bot.process_commands(message)
+
 @bot.command()
 async def ping(ctx):
     await ctx.send("pong")
 
-#Comando que responde "mundo" cuando envias !pong
 @bot.command()
 async def hola(ctx):
     await ctx.send("mundo")
 
-#Comando para enviar la imagen "lucho.jpg" cuando envias !tarzan
-#@bot.command()
-#async def tarzan(ctx):
-    #with open('lucho.jpg', 'rb') as f:
-        #await ctx.send(file=discord.File(f))
-
-#Comando para desconectar el bot del canal de voz
 @bot.command()
 async def conectar(ctx):
     canal = ctx.author.voice.channel if ctx.author.voice else None
@@ -74,45 +90,39 @@ async def conectar(ctx):
     else:
         await canal.connect()
         await ctx.send("¡Me conecté al canal de voz!")
-#Comando para desconectar el bot del canal de voz
+    iniciar_temporizador_desconexion(ctx)
+
 @bot.command()
 async def desconectar(ctx):
     voz = get(bot.voice_clients, guild=ctx.guild)
+    # cancel timer
+    if ctx.guild.id in desconexion_timers:
+        desconexion_timers[ctx.guild.id].cancel()
+        del desconexion_timers[ctx.guild.id]
     if voz and voz.is_connected():
         await voz.disconnect()
         await ctx.send("¡Adiós mundo cruel!")
     else:
         await ctx.send("¡No estoy conectado a ningún canal de voz!")
 
-#Comando  !play  acepta  nombre de la cancion o URL y la reproduce
 @bot.command(name='play')
 async def play(ctx, *, query: str):
-    # Conexión automatica al canal de voz si no está conectado 
     voz = get(bot.voice_clients, guild=ctx.guild)
     if not voz or not voz.is_connected():
         if ctx.author.voice:
             voz = await ctx.author.voice.channel.connect()
         else:
             return await ctx.send("¡Debes estar en un canal de voz!")
-
-    # Inicializa la cola si no existe para este servidor 
     music_queues.setdefault(ctx.guild.id, [])
-
-    # Si el parametro no es URL, usa búsqueda  en YouTube con "ytsearch:"
     if not query.startswith("http"):
         query = f"ytsearch:{query}"
-
-    # Añade la búsqueda o URL a la cola del servidor 
     music_queues[ctx.guild.id].append(query)
-
-    # Si ya hay musica sonando o en pausa, solo notifica y no lanza reproducción inmediata 
     if voz.is_playing() or voz.is_paused():
-        return await ctx.send("🎵 Canción añadida a la cola.")
-
-    # Si no esta reproduccion nada , inicia la reproduccion del siguiente ítem
+        await ctx.send("🎵 Canción añadida a la cola.")
+        iniciar_temporizador_desconexion(ctx)
+        return
     await _reproducir_siguiente(ctx, voz)
 
-#Comando  "skip" salta la cancion actual\@bot.command()
 @bot.command()
 async def skip(ctx):
     voz = get(bot.voice_clients, guild=ctx.guild)
@@ -120,52 +130,40 @@ async def skip(ctx):
         return await ctx.send("❌ No estoy conectado a ningún canal de voz.")
     if not voz.is_playing():
         return await ctx.send("❌ No hay nada reproduciéndose.")
-    voz.stop() #Detiene la Reproduccion actual, llama al callback "after"
+    voz.stop()
     await ctx.send("⏭️ Canción saltada.")
+    iniciar_temporizador_desconexion(ctx)
 
-#Funcion interna para reproducir el siguiente item de la cola
 async def _reproducir_siguiente(ctx, voice_client):
     queue = music_queues.get(ctx.guild.id, [])
     if not queue:
-        return await ctx.send("✅ La cola ha terminado.")
-
-    url = queue.pop(0) #Obtiene y elemina el primer elemento de la cola 
-
-    # Extrae informacion de la URL o busqueda en un hilo separdo para que no se bloquee el event loop
+        await ctx.send("✅ La cola ha terminado.")
+        iniciar_temporizador_desconexion(ctx)
+        return
+    url = queue.pop(0)
     loop = asyncio.get_event_loop()
     with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
-        info = await loop.run_in_executor(
-            None,
-            functools.partial(ydl.extract_info, url, download=False)
-        )
-
-    # Si la consulta fue una busqueda , toma el primer resultado
+        info = await loop.run_in_executor(None, functools.partial(ydl.extract_info, url, False))
     if 'entries' in info:
         info = info['entries'][0]
-
     stream_url = info.get('url')
-    titulo     = info.get('title', 'Desconocido')
-
-    # Detiene cualquier reproduccion previa y reproduce con FFmpeg
+    titulo = info.get('title', 'Desconocido')
+    if not stream_url:
+        await ctx.send("❌ No se pudo obtener una URL válida.")
+        iniciar_temporizador_desconexion(ctx)
+        return
+    audio_source = await discord.FFmpegOpusAudio.from_probe(stream_url, **FFMPEG_OPTIONS)
+    audio_source = discord.PCMVolumeTransformer(audio_source, volume=0.06)
     voice_client.stop()
-    source = discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTIONS)
-    voice_client.play(
-        source,
-        after=lambda e: asyncio.run_coroutine_threadsafe(
-            _reproducir_siguiente(ctx, voice_client),
-            bot.loop
-        )
-    )
-    #Ajusta volumen de la reproduccion
-    voice_client.source = discord.PCMVolumeTransformer(voice_client.source)
-    voice_client.source.volume = 0.06
-    # Envía un mensaje al canal indicando la canción en reproducción
+    voice_client.play(audio_source, after=lambda e: asyncio.run_coroutine_threadsafe(_reproducir_siguiente(ctx, voice_client), bot.loop))
     await ctx.send(f"▶️ Reproduciendo: **{titulo}**")
-    
-# Punto de entrada: inicia servidor web de keep-alive y ejecuta el bot
+    iniciar_temporizador_desconexion(ctx)
+
+# Inicio del bot
 if __name__ == "__main__":
     webserver.keep_alive()
-    bot.run(DISCORD_TOKEN)
+    bot.run(token)
+
 
   
 
